@@ -165,7 +165,7 @@ function buildTippecanoeArgs(config, outputPath) {
   } else {
     args.push('-zg');
   }
-  args.push(...config.extraTippecanoeArgs, '-');
+  args.push(...config.extraTippecanoeArgs);
   return args;
 }
 
@@ -331,6 +331,13 @@ function generatePmtiles(config, outputPath, context) {
 
     psql.on('error', fail);
     tippecanoe.on('error', fail);
+    psql.stdout.on('error', fail);
+    progressCounter.on('error', fail);
+    tippecanoe.stdin.on('error', (error) => {
+      if (error.code !== 'EPIPE') {
+        fail(error);
+      }
+    });
 
     psql.stdout.pipe(progressCounter).pipe(tippecanoe.stdin);
     psql.on('close', (code) => {
