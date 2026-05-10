@@ -4,9 +4,11 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { Transform } = require('node:stream');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+let requestSequence = 0;
 
 function loadEnv(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -167,15 +169,87 @@ function buildTippecanoeArgs(config, outputPath) {
   return args;
 }
 
-function collectProcessError(processName, child) {
+function now() {
+  return new Date().toISOString();
+}
+
+function logInfo(message, context = {}) {
+  console.log(formatLog('info', message, context));
+}
+
+function logError(message, context = {}) {
+  console.error(formatLog('error', message, context));
+}
+
+function formatLog(level, message, context) {
+  const fields = Object.entries(context)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(' ');
+  return `[${now()}] ${level.toUpperCase()} ${message}${fields ? ` ${fields}` : ''}`;
+}
+
+function createProgressCounter(context) {
+  let featureCount = 0;
+  let byteCount = 0;
+  let pending = '';
+  let lastLoggedAt = Date.now();
+  let nextFeatureLog = 10000;
+
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      const text = chunk.toString();
+      byteCount += Buffer.byteLength(chunk);
+      pending += text;
+
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+      featureCount += lines.filter(Boolean).length;
+
+      const shouldLog =
+        featureCount > 0 &&
+        (featureCount >= nextFeatureLog || Date.now() - lastLoggedAt >= 5000);
+      if (shouldLog) {
+        lastLoggedAt = Date.now();
+        nextFeatureLog = featureCount + 10000;
+        logInfo('export progress', {
+          ...context,
+          features: featureCount,
+          bytes: byteCount,
+        });
+      }
+
+      callback(null, chunk);
+    },
+    flush(callback) {
+      if (pending.trim()) {
+        featureCount += 1;
+      }
+      logInfo('export stream complete', {
+        ...context,
+        features: featureCount,
+        bytes: byteCount,
+      });
+      callback();
+    },
+  });
+}
+
+function collectProcessError(processName, child, context = {}) {
   let stderr = '';
   child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString();
+    const text = chunk.toString();
+    stderr += text;
+    for (const line of text.split(/\r?\n/)) {
+      if (line.trim()) {
+        logInfo(`${processName} output`, { ...context, message: line.trim() });
+      }
+    }
   });
   return () => `${processName} failed: ${stderr.trim() || 'no stderr output'}`;
 }
 
-function generatePmtiles(config, outputPath) {
+function generatePmtiles(config, outputPath, context) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 
@@ -199,18 +273,37 @@ function generatePmtiles(config, outputPath) {
     const tippecanoeArgs = buildTippecanoeArgs(config, outputPath);
     const childEnv = { ...process.env, PGPASSWORD: config.pgPassword };
 
+    logInfo('generation started', {
+      ...context,
+      table: `${config.schema}.${config.table}`,
+      layer: config.layerName,
+      outputPath,
+    });
+    logInfo('starting psql export', context);
     const psql = spawn(config.psqlBin, psqlArgs, { env: childEnv });
+    logInfo('starting tippecanoe conversion', {
+      ...context,
+      minZoom: config.minZoom,
+      maxZoom: config.maxZoom || 'auto',
+    });
     const tippecanoe = spawn(config.tippecanoeBin, tippecanoeArgs);
+    const progressCounter = createProgressCounter(context);
 
-    const psqlErrorMessage = collectProcessError('psql', psql);
-    const tippecanoeErrorMessage = collectProcessError('tippecanoe', tippecanoe);
+    const psqlErrorMessage = collectProcessError('psql', psql, context);
+    const tippecanoeErrorMessage = collectProcessError('tippecanoe', tippecanoe, context);
     let psqlExitCode = null;
     let tippecanoeExitCode = null;
     let settled = false;
+    const startedAt = Date.now();
 
     function fail(error) {
       if (!settled) {
         settled = true;
+        logError('generation failed', {
+          ...context,
+          error: error.message,
+          durationMs: Date.now() - startedAt,
+        });
         reject(error);
       }
     }
@@ -228,20 +321,26 @@ function generatePmtiles(config, outputPath) {
         return;
       }
       settled = true;
+      logInfo('generation completed', {
+        ...context,
+        outputPath,
+        durationMs: Date.now() - startedAt,
+      });
       resolve();
     }
 
     psql.on('error', fail);
     tippecanoe.on('error', fail);
 
-    psql.stdout.pipe(tippecanoe.stdin, { end: false });
+    psql.stdout.pipe(progressCounter).pipe(tippecanoe.stdin);
     psql.on('close', (code) => {
       psqlExitCode = code;
-      tippecanoe.stdin.end();
+      logInfo('psql export finished', { ...context, exitCode: code });
       maybeResolve();
     });
     tippecanoe.on('close', (code) => {
       tippecanoeExitCode = code;
+      logInfo('tippecanoe conversion finished', { ...context, exitCode: code });
       maybeResolve();
     });
   });
@@ -281,10 +380,24 @@ function readJsonBody(request) {
 
 async function handleRequest(request, response) {
   const url = new URL(request.url, `http://${request.headers.host}`);
+  const requestId = `req-${++requestSequence}`;
+  const startedAt = Date.now();
+  request.requestId = requestId;
   const config = getConfig();
+
+  logInfo('request received', {
+    requestId,
+    method: request.method,
+    path: url.pathname,
+  });
 
   if (request.method === 'GET' && url.pathname === '/health') {
     sendJson(response, 200, { ok: true });
+    logInfo('request completed', {
+      requestId,
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+    });
     return;
   }
 
@@ -292,7 +405,7 @@ async function handleRequest(request, response) {
     const body = await readJsonBody(request);
     const outputPath = safeOutputPath(config, body.outputFilename);
 
-    await generatePmtiles(config, outputPath);
+    await generatePmtiles(config, outputPath, { requestId });
 
     sendJson(response, 200, {
       ok: true,
@@ -300,10 +413,20 @@ async function handleRequest(request, response) {
       table: `${config.schema}.${config.table}`,
       layer: config.layerName,
     });
+    logInfo('request completed', {
+      requestId,
+      statusCode: 200,
+      durationMs: Date.now() - startedAt,
+    });
     return;
   }
 
   sendJson(response, 404, { ok: false, error: 'Not found' });
+  logInfo('request completed', {
+    requestId,
+    statusCode: 404,
+    durationMs: Date.now() - startedAt,
+  });
 }
 
 function start() {
@@ -313,6 +436,13 @@ function start() {
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {
       const statusCode = error.statusCode || 500;
+      logError('request failed', {
+        requestId: request.requestId,
+        method: request.method,
+        url: request.url,
+        statusCode,
+        error: error.message,
+      });
       sendJson(response, statusCode, {
         ok: false,
         error: error.message,
