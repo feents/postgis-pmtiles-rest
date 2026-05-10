@@ -1,0 +1,19 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        TIPPECANOE_VERSION: "2.53.0"
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      OUTPUT_DIR: /app/output
+      TIPPECANOE_BIN: tippecanoe
+      PSQL_BIN: psql
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./output:/app/output
+    restart: unless-stopped
