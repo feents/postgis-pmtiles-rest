@@ -124,21 +124,19 @@ function getConfig() {
   };
 }
 
-function buildCopySql(config) {
+function buildFeatureSql(config) {
   const tableRef = `${quoteIdentifier(config.schema)}.${quoteIdentifier(config.table)}`;
   const geometryRef = `t.${quoteIdentifier(config.geometryColumn)}`;
   const propertiesExpression = `to_jsonb(t) - ${quoteLiteral(config.geometryColumn)}`;
 
   return `
-COPY (
-  SELECT jsonb_strip_nulls(jsonb_build_object(
-    'type', 'Feature',
-    'geometry', ST_AsGeoJSON(${geometryRef})::jsonb,
-    'properties', ${propertiesExpression}
-  ))::text
-  FROM ${tableRef} AS t
-  WHERE ${geometryRef} IS NOT NULL
-) TO STDOUT;
+SELECT jsonb_strip_nulls(jsonb_build_object(
+  'type', 'Feature',
+  'geometry', ST_AsGeoJSON(${geometryRef})::jsonb,
+  'properties', ${propertiesExpression}
+))::text
+FROM ${tableRef} AS t
+WHERE ${geometryRef} IS NOT NULL;
 `;
 }
 
@@ -235,15 +233,41 @@ function createProgressCounter(context) {
   });
 }
 
+function createProcessOutputLogger(processName, context) {
+  let lastProgressLogAt = 0;
+  let pendingProgress = '';
+
+  return (line) => {
+    const message = line.trim();
+    if (!message) {
+      return;
+    }
+
+    const isProgress = /^(Read \d|Reordering geometry:|\d+(?:\.\d+)?%\s)/.test(message);
+    if (!isProgress) {
+      logInfo(`${processName} output`, { ...context, message });
+      return;
+    }
+
+    pendingProgress = message;
+    const nowMs = Date.now();
+    if (nowMs - lastProgressLogAt >= 1000) {
+      lastProgressLogAt = nowMs;
+      logInfo(`${processName} progress`, { ...context, message: pendingProgress });
+      pendingProgress = '';
+    }
+  };
+}
+
 function collectProcessError(processName, child, context = {}) {
   let stderr = '';
+  const logProcessOutput = createProcessOutputLogger(processName, context);
+
   child.stderr.on('data', (chunk) => {
     const text = chunk.toString();
     stderr += text;
-    for (const line of text.split(/\r?\n/)) {
-      if (line.trim()) {
-        logInfo(`${processName} output`, { ...context, message: line.trim() });
-      }
+    for (const line of text.split(/[\r\n]+/)) {
+      logProcessOutput(line);
     }
   });
   return () => `${processName} failed: ${stderr.trim() || 'no stderr output'}`;
@@ -254,6 +278,7 @@ function generatePmtiles(config, outputPath, context) {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 
     const psqlArgs = [
+      '-X',
       '-h',
       config.pgHost,
       '-p',
@@ -268,7 +293,7 @@ function generatePmtiles(config, outputPath, context) {
       '-A',
       '-t',
       '-c',
-      buildCopySql(config),
+      buildFeatureSql(config),
     ];
     const tippecanoeArgs = buildTippecanoeArgs(config, outputPath);
     const childEnv = { ...process.env, PGPASSWORD: config.pgPassword };
